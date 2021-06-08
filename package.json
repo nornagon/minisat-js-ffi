@@ -1,5 +1,8 @@
 {
   "name": "minisat-js-ffi",
+  "version": "0.1.0",
+  "description": "JS bindings for the native minisat library",
+  "author": "Jeremy Rose <nornagon@nornagon.net>",
   "scripts": {
     "install": "cmake-js compile"
   },
