@@ -69,12 +69,9 @@ Solver_addClause(napi_env env, napi_callback_info info) {
     NAPI_CALL(env, napi_get_element(env, argv[0], i, &elem));
     int32_t var;
     NAPI_CALL(env, napi_get_value_int32(env, elem, &var));
-    double sign;
-    NAPI_CALL(env, napi_get_value_double(env, elem, &sign));
-    // detect -0.0. asking for trouble?
-    lits.push(!std::signbit(sign) ? Minisat::mkLit(var) : ~Minisat::mkLit(-var));
+    lits.push(var > 0 ? Minisat::mkLit(var - 1) : ~Minisat::mkLit(-var - 1));
   }
-  solver->addClause(lits);
+  solver->addClause_(lits);
 
   return nullptr;
 }
@@ -92,9 +89,44 @@ Solver_simplify(napi_env env, napi_callback_info info) {
 
   napi_value result;
   NAPI_CALL(env, napi_get_boolean(env, s, &result));
-  
+
   return result;
 }
+
+struct Solver_solve__async_data {
+  napi_async_work request;
+  Minisat::Solver* solver;
+  napi_deferred deferred;
+  napi_ref ref;
+  Minisat::lbool result;
+};
+
+void Solver_solve__async(napi_env env, void* data) {
+  Solver_solve__async_data* async_data = reinterpret_cast<Solver_solve__async_data*>(data);
+  Minisat::vec<Minisat::Lit> dummy;
+  async_data->result = async_data->solver->solveLimited(dummy);
+}
+void Solver_solve__complete(napi_env env, napi_status status, void* data) {
+  Solver_solve__async_data* async_data = reinterpret_cast<Solver_solve__async_data*>(data);
+  Minisat::Solver* solver = async_data->solver;
+  napi_deferred deferred = async_data->deferred;
+  Minisat::lbool result = async_data->result;
+  napi_delete_async_work(env, async_data->request);
+  napi_delete_reference(env, async_data->ref);
+  delete async_data;
+  if (status != napi_ok) {
+    napi_throw_type_error(env, NULL, "Solve callback failed.");
+    return;
+  }
+
+  napi_value result_value;
+  if (result == Minisat::l_Undef)
+    napi_get_undefined(env, &result_value);
+  else
+    napi_get_boolean(env, result == Minisat::l_True, &result_value);
+  napi_resolve_deferred(env, deferred, result_value);
+}
+
 
 static napi_value
 Solver_solve(napi_env env, napi_callback_info info) {
@@ -104,13 +136,23 @@ Solver_solve(napi_env env, napi_callback_info info) {
 
   Minisat::Solver* solver = nullptr;
   NAPI_CALL(env, napi_unwrap(env, self, reinterpret_cast<void**>(&solver)));
+  solver->clearInterrupt();
 
-  bool s = solver->solve();
+  napi_value resource_name;
+  NAPI_CALL(env, napi_create_string_utf8(env, "Minisat::Solver::solve", NAPI_AUTO_LENGTH, &resource_name));
 
-  napi_value result;
-  NAPI_CALL(env, napi_get_boolean(env, s, &result));
-  
-  return result;
+  Solver_solve__async_data* async_data = new Solver_solve__async_data;
+  async_data->solver = solver;
+  napi_value promise;
+  NAPI_CALL(env, napi_create_promise(env, &async_data->deferred, &promise));
+
+  NAPI_CALL(env, napi_create_reference(env, self, 1, &async_data->ref));
+  NAPI_CALL(env, napi_create_async_work(env, nullptr, resource_name, Solver_solve__async, Solver_solve__complete, async_data, &async_data->request));
+
+
+  NAPI_CALL(env, napi_queue_async_work(env, async_data->request));
+
+  return promise;
 }
 
 static napi_value
@@ -126,8 +168,87 @@ Solver_okay(napi_env env, napi_callback_info info) {
 
   napi_value result;
   NAPI_CALL(env, napi_get_boolean(env, s, &result));
-  
+
   return result;
+}
+
+static napi_value
+Solver_value(napi_env env, napi_callback_info info) {
+  napi_value self;
+
+  size_t argc = 1;
+  napi_value argv[1];
+
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, &self, nullptr));
+
+  Minisat::Solver* solver = nullptr;
+  NAPI_CALL(env, napi_unwrap(env, self, reinterpret_cast<void**>(&solver)));
+
+  int32_t var;
+  NAPI_CALL(env, napi_get_value_int32(env, argv[0], &var));
+
+  Minisat::lbool val = solver->modelValue(var > 0 ? Minisat::mkLit(var - 1) : ~Minisat::mkLit(-var - 1));
+
+  napi_value result;
+  if (val == Minisat::l_Undef)
+    NAPI_CALL(env, napi_get_undefined(env, &result));
+  else
+    NAPI_CALL(env, napi_get_boolean(env, val == Minisat::l_True, &result));
+  return result;
+}
+
+static napi_value
+Solver_interrupt(napi_env env, napi_callback_info info) {
+  napi_value self;
+
+  NAPI_CALL(env, napi_get_cb_info(env, info, nullptr, nullptr, &self, nullptr));
+
+  Minisat::Solver* solver = nullptr;
+  NAPI_CALL(env, napi_unwrap(env, self, reinterpret_cast<void**>(&solver)));
+  solver->interrupt();
+
+  return nullptr;
+}
+
+static napi_value
+Solver_printStats(napi_env env, napi_callback_info info) {
+  napi_value self;
+
+  NAPI_CALL(env, napi_get_cb_info(env, info, nullptr, nullptr, &self, nullptr));
+
+  Minisat::Solver* solver = nullptr;
+  NAPI_CALL(env, napi_unwrap(env, self, reinterpret_cast<void**>(&solver)));
+  solver->printStats();
+
+  return nullptr;
+}
+
+static napi_value
+Solver_stats(napi_env env, napi_callback_info info) {
+  napi_value self;
+
+  NAPI_CALL(env, napi_get_cb_info(env, info, nullptr, nullptr, &self, nullptr));
+
+  Minisat::Solver* solver = nullptr;
+  NAPI_CALL(env, napi_unwrap(env, self, reinterpret_cast<void**>(&solver)));
+
+  napi_value ret;
+  NAPI_CALL(env, napi_create_object(env, &ret));
+
+  napi_value num;
+  NAPI_CALL(env, napi_create_int32(env, solver->starts, &num));
+  NAPI_CALL(env, napi_set_named_property(env, ret, "restarts", num));
+
+  NAPI_CALL(env, napi_create_int32(env, solver->conflicts, &num));
+  NAPI_CALL(env, napi_set_named_property(env, ret, "conflicts", num));
+
+  NAPI_CALL(env, napi_create_int32(env, solver->decisions, &num));
+  NAPI_CALL(env, napi_set_named_property(env, ret, "decisions", num));
+
+  NAPI_CALL(env, napi_create_int32(env, solver->propagations, &num));
+  NAPI_CALL(env, napi_set_named_property(env, ret, "propagations", num));
+
+  return ret;
 }
 
 napi_value create_addon(napi_env env) {
@@ -140,6 +261,10 @@ napi_value create_addon(napi_env env) {
     { "okay", .method = Solver_okay },
     { "newVar", .method = Solver_newVar },
     { "addClause", .method = Solver_addClause },
+    { "value", .method = Solver_value },
+    { "interrupt", .method = Solver_interrupt },
+    { "printStats", .method = Solver_printStats },
+    { "stats", .getter = Solver_stats },
   };
 
   napi_value class_Solver;
